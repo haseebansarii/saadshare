@@ -14,7 +14,7 @@ import { X } from 'lucide-react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Audio } from 'expo-av';
 import { spacing } from '@/constants/colors';
-import { OPENAI_API_KEY } from '@/constants/config';
+import { OPENAI_API_KEY } from '@/constants/config'; 
 import { textToSpeech } from '@/services/elevenlabs-tts';
 
 export default function DemoConversationScreen() {
@@ -36,6 +36,12 @@ export default function DemoConversationScreen() {
   const isProcessingRef = useRef(false);
   const monitoringIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isSpeakingRef = useRef(false);
+  
+  // Voice activity detection state
+  const vadHistoryRef = useRef<number[]>([]);
+  const speechDetectionCountRef = useRef(0);
+  const noiseFloorRef = useRef<number>(-60); // Dynamic noise floor
+  const lastSpeechTimeRef = useRef<number>(0);
 
   // Initialize audio permissions
   useEffect(() => {
@@ -170,6 +176,12 @@ export default function DemoConversationScreen() {
         await soundRef.current.unloadAsync();
       } catch (e) {}
     }
+    
+    // Reset VAD state
+    vadHistoryRef.current = [];
+    speechDetectionCountRef.current = 0;
+    noiseFloorRef.current = -60;
+    lastSpeechTimeRef.current = 0;
   };
 
   const initAudio = async () => {
@@ -240,7 +252,7 @@ export default function DemoConversationScreen() {
       recordingRef.current = recording;
       isSpeakingRef.current = false;
 
-      // Monitor audio levels for voice activity
+      // Monitor audio levels for voice activity with improved detection
       monitoringIntervalRef.current = setInterval(async () => {
         if (!recordingRef.current) return;
 
@@ -248,36 +260,82 @@ export default function DemoConversationScreen() {
           const status = await recordingRef.current.getStatusAsync();
           if (status.isRecording && status.metering !== undefined) {
             const metering = status.metering;
+            const currentTime = Date.now();
             
-            // Detect speech (metering typically ranges from -160 to 0)
-            // Threshold: -40 dB for speech detection
-            if (metering > -40) {
-              // User is speaking
-              if (!isSpeakingRef.current) {
+            // Update VAD history (keep last 10 readings for analysis)
+            vadHistoryRef.current.push(metering);
+            if (vadHistoryRef.current.length > 10) {
+              vadHistoryRef.current.shift();
+            }
+
+            // Update dynamic noise floor (adapt to environment) - more conservative
+            if (vadHistoryRef.current.length >= 8) {
+              const sortedHistory = [...vadHistoryRef.current].sort((a, b) => a - b);
+              // Use lower quartile instead of median for noise floor
+              const lowerQuartile = sortedHistory[Math.floor(sortedHistory.length * 0.25)];
+              noiseFloorRef.current = Math.max(noiseFloorRef.current * 0.98 + lowerQuartile * 0.02, -80);
+            }
+
+            // Enhanced speech detection logic with balanced thresholds
+            const speechThreshold = Math.max(noiseFloorRef.current + 12, -50); // 12dB above noise floor, min -50dB
+            const minSpeechLevel = -55; // More sensitive minimum for speech
+            const maxNoiseLevel = -25; // Higher ceiling to allow louder speech
+            
+            // Check if current level indicates speech
+            const isSpeechLevel = metering > speechThreshold && metering > minSpeechLevel;
+            
+            // Analyze recent history for speech patterns (more lenient)
+            const recentHighLevels = vadHistoryRef.current.filter(level => 
+              level > speechThreshold && level > minSpeechLevel
+            ).length;
+            
+            // Log all audio levels for debugging
+            // console.log('[VAD Debug] Level:', metering.toFixed(1), 'Threshold:', speechThreshold.toFixed(1), 'Noise Floor:', noiseFloorRef.current.toFixed(1), 'Recent High:', recentHighLevels);
+            
+            // Speech detection with more balanced pattern analysis
+            if (isSpeechLevel && recentHighLevels >= 2) {
+              speechDetectionCountRef.current++;
+              
+              // Require less sustained detection for initial trigger
+              if (speechDetectionCountRef.current >= 2 && !isSpeakingRef.current) {
                 isSpeakingRef.current = true;
                 setIsListening(true);
                 setStatus('Listening...');
-                console.log('[VAD] Speech detected, metering:', metering);
+                lastSpeechTimeRef.current = currentTime;
+                console.log('[VAD] Speech detected - Level:', metering, 'Threshold:', speechThreshold, 'Noise Floor:', noiseFloorRef.current);
               }
               
-              // Reset silence timer
-              if (silenceTimerRef.current) {
-                clearTimeout(silenceTimerRef.current);
-              }
-              
-              // Set new silence timer (1.5 seconds of silence to stop)
-              silenceTimerRef.current = setTimeout(() => {
-                if (isSpeakingRef.current) {
-                  console.log('[VAD] Silence detected');
-                  stopListeningAndProcess();
+              // Reset silence timer while speaking
+              if (isSpeakingRef.current) {
+                lastSpeechTimeRef.current = currentTime;
+                if (silenceTimerRef.current) {
+                  clearTimeout(silenceTimerRef.current);
                 }
-              }, 1500);
+                
+                // Set silence timer (1.5 seconds of silence to stop)
+                silenceTimerRef.current = setTimeout(() => {
+                  if (isSpeakingRef.current) {
+                    console.log('[VAD] Silence detected');
+                    stopListeningAndProcess();
+                  }
+                }, 1500);
+              }
+            } else {
+              // More gradual reset of speech detection counter
+              if (speechDetectionCountRef.current > 0 && !isSpeechLevel) {
+                speechDetectionCountRef.current = Math.max(0, speechDetectionCountRef.current - 1);
+              }
+              
+              // Only log very loud background noise
+              if (metering > -25 && !isSpeechLevel) {
+                console.log('[VAD] Loud noise detected (ignored) - Level:', metering, 'Type: Likely background noise');
+              }
             }
           }
         } catch (error) {
           console.error('[VAD Error]', error);
         }
-      }, 100); // Check every 100ms
+      }, 150); // Check every 150ms (slightly less frequent to reduce processing)
 
     } catch (error) {
       console.error('[Recording Error]', error);
@@ -315,6 +373,10 @@ export default function DemoConversationScreen() {
         silenceTimerRef.current = null;
       }
 
+      // Reset VAD counters
+      speechDetectionCountRef.current = 0;
+      vadHistoryRef.current = [];
+
       const recording = recordingRef.current;
       if (!recording) {
         isProcessingRef.current = false;
@@ -337,8 +399,24 @@ export default function DemoConversationScreen() {
       // Send to API
       const transcript = await sendAudioToAPI(uri);
       
-      if (!transcript || transcript.trim().length === 0) {
-        console.log('[Transcript] Empty or no speech detected');
+      if (!transcript || transcript.trim().length === 0 || transcript.trim().length < 3) {
+        console.log('[Transcript] Empty, too short, or no speech detected:', transcript);
+        isProcessingRef.current = false;
+        startListening();
+        return;
+      }
+
+      // Additional filter for common noise transcriptions
+      const noisePatterns = [
+        /^[.,-\s]*$/,  // Just punctuation and spaces
+        /^(uh|um|hmm|ah|eh)[\s.,-]*$/i,  // Common filler sounds
+        /^[a-z]{1,2}[\s.,-]*$/i,  // Very short single letters
+        /^\d+[\s.,-]*$/,  // Just numbers (often from noise)
+        /^(the|a|an|and|or|but|in|on|at|to|for|of|with|by)[\s.,-]*$/i,  // Single common words
+      ];
+      
+      if (noisePatterns.some(pattern => pattern.test(transcript.trim()))) {
+        console.log('[Transcript] Filtered out noise/gibberish:', transcript);
         isProcessingRef.current = false;
         startListening();
         return;
