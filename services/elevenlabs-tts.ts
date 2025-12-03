@@ -48,6 +48,7 @@ export async function textToSpeech(
             style,
             use_speaker_boost: useSpeakerBoost,
           },
+          output_format: 'mp3_44100_128',
         }),
       }
     );

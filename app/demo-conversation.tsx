@@ -509,13 +509,22 @@ export default function DemoConversationScreen() {
       setIsSpeaking(true);
       setStatus('Speaking...');
 
+      // Configure audio mode for playback (iOS needs speaker output at full volume)
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+        staysActiveInBackground: false,
+      });
+
       // Generate TTS
       const audioUri = await textToSpeech(text);
       
-      // Play audio
+      // Play audio with maximum volume
       const { sound } = await Audio.Sound.createAsync(
         { uri: audioUri },
-        { shouldPlay: true }
+        { shouldPlay: true, volume: 1.0 }
       );
       soundRef.current = sound;
 
